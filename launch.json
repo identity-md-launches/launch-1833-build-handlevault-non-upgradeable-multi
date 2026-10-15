@@ -1,0 +1,23 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "MockUSDC",
+      "constructorArgs": [
+        "$owner"
+      ]
+    },
+    {
+      "contract": "HandleVault",
+      "constructorArgs": [
+        "$owner",
+        "$contract:MockUSDC",
+        "100000000000000",
+        "1000000",
+        "10000000000000000000",
+        "100000000000"
+      ]
+    }
+  ],
+  "notes": "Two application contracts on Sepolia, in constructor dependency order, each receiving zero native value. MockUSDC(address initialOwner): a six-decimal test token named Mock USDC (symbol mUSDC) with zero initial supply; only its owner can mint, and ownership transfer is two-step. The owner argument is $owner, the launch owner wallet; it holds mint authority only and has no power over vault funds. HandleVault(address initialOwner, address initialToken, uint256 nativeMinimum, uint256 tokenMinimum, uint256 nativeCap, uint256 tokenCap): a non-upgradeable multi-token escrow that pays funds to opaque bytes32 recipient ids on a valid EIP-712 Claim signed by an AUTHORIZER_ROLE key, or refunds a deposit to its original sender after the immutable 180-day REFUND_DELAY. initialOwner is $owner and becomes DEFAULT_ADMIN_ROLE (two-step hand-over with a one-day delay via AccessControlDefaultAdminRules), AUTHORIZER_ROLE, PAUSER_ROLE and the initial feeRecipient; feeBps starts at 0 with a hard maximum of 100. initialToken is $contract:MockUSDC, the token deployed first in this manifest; the constructor only records its address and configuration without calling it, so deployment on an empty chain succeeds and the token is checked on first deposit. The four numeric arguments are raw base units matching script/DeployHandleVault.s.sol and the README: nativeMinimum 100000000000000 wei (0.0001 ETH), tokenMinimum 1000000 (1 mUSDC), nativeCap 10000000000000000000 wei (10 ETH per rolling 24 hours of claims), tokenCap 100000000000 (100,000 mUSDC per rolling 24 hours of claims). Native ETH and MockUSDC are allowlisted in the constructor; minimums, allowlist, caps, fee and fee recipient remain admin-settable. No role can move escrowed principal except through a valid claim or a refund to the original sender. Pause stops deposits and claims but never refunds or fee withdrawal. No initialization calls, ETH funding, proxies or delegatecall are involved. The off-chain signer must use the confirmed HandleVault address in the EIP-712 domain (name HandleVault, version 1, chain id 11155111) as documented in README.md."
+}
