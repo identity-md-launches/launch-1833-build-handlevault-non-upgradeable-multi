@@ -249,10 +249,13 @@ contract AdversaryHandler is Test {
         vm.startPrank(attacker);
         bytes memory denied =
             abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, attacker, adminRole);
-        uint256 branch = which % 8;
+        uint256 branch = which % 9;
         if (branch == 0) {
             vm.expectRevert(denied);
             vault.setFee(bound(value, 0, 100), attacker);
+        } else if (branch == 8) {
+            vm.expectRevert(denied);
+            vault.setRecipientShareBps(bound(value, 1, 10_000));
         } else if (branch == 1) {
             vm.expectRevert(denied);
             vault.setOutflowCap(address(usdc), value);
@@ -482,11 +485,19 @@ contract HandleVaultSecurityInvariantTest is StdInvariant, Test {
         assertEq(vault.feeRecipient(), authorizer);
         assertEq(vault.outflowCaps(address(usdc)), 100_000e6);
         assertEq(vault.outflowCaps(address(0)), 10 ether);
+        assertEq(vault.recipientShareBps(), 10_000);
     }
 
     function invariant_rollingOutflowNeverExceedsCap() public view {
         assertLe(vault.rollingOutflow(address(usdc)), 100_000e6);
         assertLe(vault.rollingOutflow(address(0)), 10 ether);
+        bytes32[2] memory recipients = [keccak256("victim recipient"), keccak256("attacker recipient")];
+        for (uint256 i; i < 2; ++i) {
+            assertLe(vault.recipientRollingOutflow(recipients[i], address(usdc)), vault.recipientCap(address(usdc)));
+            assertLe(vault.recipientRollingOutflow(recipients[i], address(0)), vault.recipientCap(address(0)));
+            assertLe(vault.recipientRollingOutflow(recipients[i], address(usdc)), vault.rollingOutflow(address(usdc)));
+            assertLe(vault.recipientRollingOutflow(recipients[i], address(0)), vault.rollingOutflow(address(0)));
+        }
     }
 
     function afterInvariant() public view {

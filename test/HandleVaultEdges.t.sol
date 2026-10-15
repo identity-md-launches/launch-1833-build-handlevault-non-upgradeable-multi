@@ -28,6 +28,8 @@ contract HandleVaultEdgesTest is VaultFixture {
     event FeeConfigured(uint256 feeBps, address indexed feeRecipient);
     event FeesWithdrawn(address indexed token, address indexed recipient, uint256 amount);
     event ClaimProcessed(bytes32 indexed recipientId, uint256 indexed nonce, address indexed dest, uint256 count);
+    event RecipientShareSet(uint256 oldShareBps, uint256 newShareBps);
+    event DepositSkipped(uint256 indexed depositId, bytes32 indexed recipientId, address indexed token);
 
     // ---------------------------------------------------------------------------------------
     // Events
@@ -45,8 +47,11 @@ contract HandleVaultEdgesTest is VaultFixture {
         emit OutflowCapSet(address(usdc), 0, 100_000e6);
         vm.expectEmit(true, true, true, true, predicted);
         emit FeeConfigured(0, owner);
+        vm.expectEmit(true, true, true, true, predicted);
+        emit RecipientShareSet(0, 10_000);
         HandleVault fresh = new HandleVault(owner, address(usdc), 0.0001 ether, 1e6, 10 ether, 100_000e6);
         assertEq(address(fresh), predicted);
+        assertEq(fresh.recipientShareBps(), 10_000);
     }
 
     function test_adminSettersEmitOldAndNewValues() public {
@@ -200,9 +205,10 @@ contract HandleVaultEdgesTest is VaultFixture {
         assertEq(vault.totalEscrowed(RECIPIENT, address(usdc)), 1e6);
     }
 
-    /// @dev FIFO head-of-line: a queue stops at the first deposit that does not fit even if a
-    /// later, smaller one would. Documented behaviour; pinned so a change is noticed.
-    function test_capBlockingIsHeadOfLineFifo() public {
+    /// @dev A deposit at the head of the FIFO that does not fit the remaining window is skipped,
+    /// stays open, and is announced; the smaller one behind it is paid in the same call. Once the
+    /// window clears the skipped head is paid first, so FIFO order is preserved among what fits.
+    function test_oversizedHeadIsSkippedAndAnnouncedNotBlocking() public {
         vm.prank(owner);
         vault.setOutflowCap(address(usdc), 1000e6);
         _deposit(RECIPIENT, address(usdc), 900e6);
@@ -210,13 +216,56 @@ contract HandleVaultEdgesTest is VaultFixture {
         uint256 big = _deposit(RECIPIENT, address(usdc), 500e6);
         uint256 small = _deposit(RECIPIENT, address(usdc), 50e6);
         assertEq(vault.remainingOutflow(address(usdc)), 100e6);
+        uint256 deadline = vm.getBlockTimestamp() + 1 hours;
+        bytes memory sig = _signature(OWNER_KEY, RECIPIENT, dest, 1, deadline);
+        vm.expectEmit(true, true, true, true, address(vault));
+        emit DepositSkipped(big, RECIPIENT, address(usdc));
+        vm.expectEmit(true, true, true, true, address(vault));
+        emit Claimed(small, RECIPIENT, address(usdc), 50e6, dest, 0);
+        vm.expectEmit(true, true, true, true, address(vault));
+        emit ClaimProcessed(RECIPIENT, 1, dest, 1);
+        assertEq(vault.claim(RECIPIENT, dest, _tokens(address(usdc)), 1, deadline, sig), 1);
+        assertEq(uint256(_status(small)), uint256(HandleVault.Status.Claimed));
+        assertEq(uint256(_status(big)), uint256(HandleVault.Status.Open));
+        assertEq(vault.firstOpenDeposit(RECIPIENT, address(usdc)), big);
+        assertEq(vault.openDepositCount(RECIPIENT), 1);
+        assertEq(vault.rollingOutflow(address(usdc)), 950e6);
+        assertEq(usdc.balanceOf(dest), 950e6);
+        // Still too large for the 50 mUSDC left in the window: nothing fits, nonce untouched.
+        bytes memory retry = _signature(OWNER_KEY, RECIPIENT, dest, 2, deadline);
         vm.expectRevert(HandleVault.OutflowCapExceeded.selector);
-        _claim(RECIPIENT, dest, _tokens(address(usdc)), 1);
-        assertEq(uint256(_status(small)), uint256(HandleVault.Status.Open));
+        vault.claim(RECIPIENT, dest, _tokens(address(usdc)), 2, deadline, retry);
+        assertFalse(vault.usedNonces(RECIPIENT, 2));
         vm.warp(vm.getBlockTimestamp() + 24 hours);
-        assertEq(_claim(RECIPIENT, dest, _tokens(address(usdc)), 1), 2);
+        assertEq(_claim(RECIPIENT, dest, _tokens(address(usdc)), 2), 1);
         assertEq(uint256(_status(big)), uint256(HandleVault.Status.Claimed));
         assertEq(usdc.balanceOf(dest), 1450e6);
+        _assertAccounting(address(usdc));
+    }
+
+    /// @dev Exactly 255 unfit deposits ahead of one that fits still leave one visit for it: the
+    /// 256-visit budget counts the paying deposit too, so this is the last position that succeeds.
+    function test_visitBudgetReachesFittingDepositInLastSlot() public {
+        vm.prank(owner);
+        vault.setOutflowCap(address(usdc), 1000e6);
+        _deposit(SECOND_RECIPIENT, address(usdc), 500e6);
+        _claim(SECOND_RECIPIENT, treasury, _tokens(address(usdc)), 0);
+        uint256 visits = vault.MAX_VISITS_PER_CLAIM();
+        for (uint256 i; i < visits - 1; ++i) {
+            _deposit(RECIPIENT, address(usdc), 600e6);
+        }
+        uint256 wanted = _deposit(RECIPIENT, address(usdc), 1e6);
+        uint256 afterWanted = _deposit(RECIPIENT, address(usdc), 2e6);
+        assertEq(_claim(RECIPIENT, dest, _tokens(address(usdc)), 0), 1);
+        assertEq(uint256(_status(wanted)), uint256(HandleVault.Status.Claimed));
+        assertEq(uint256(_status(afterWanted)), uint256(HandleVault.Status.Open), "beyond the visit budget");
+        assertEq(usdc.balanceOf(dest), 1e6);
+        assertEq(vault.openDepositCount(RECIPIENT), visits);
+        // With the paid one gone, the next fitting deposit moves into the last reachable slot.
+        assertEq(_claim(RECIPIENT, dest, _tokens(address(usdc)), 1), 1);
+        assertEq(uint256(_status(afterWanted)), uint256(HandleVault.Status.Claimed));
+        assertEq(usdc.balanceOf(dest), 3e6);
+        _assertAccounting(address(usdc));
     }
 
     function test_adminLoweringCapBelowOpenDepositBlocksClaimButNotRefund() public {
@@ -289,6 +338,8 @@ contract HandleVaultEdgesTest is VaultFixture {
             vm.expectRevert(denied);
             vault.setTokenConfig(address(usdc), true, 1);
             vm.expectRevert(denied);
+            vault.setRecipientShareBps(1);
+            vm.expectRevert(denied);
             vault.grantRole(authorizerRole, operator);
             vm.expectRevert(denied);
             vault.revokeRole(pauserRole, owner);
@@ -303,6 +354,7 @@ contract HandleVaultEdgesTest is VaultFixture {
         vault.pause();
         assertEq(vault.feeRecipient(), owner);
         assertEq(vault.feeBps(), 0);
+        assertEq(vault.recipientShareBps(), 10_000);
     }
 
     function test_authorizerRenouncingItselfInvalidatesItsSignatures() public {
@@ -421,36 +473,106 @@ contract HandleVaultEdgesTest is VaultFixture {
         _assertAccounting(address(usdc));
     }
 
-    function testFuzz_claimFollowsFifoUntilFirstDepositThatBreaksCap(uint96[4] memory rawAmounts, uint96 rawCap)
+    /// @dev Reference model of one sweep: walk the FIFO, pay each deposit that fits what is left
+    /// of the window, skip (leave open) each one that does not, never stop early.
+    function testFuzz_claimPaysEveryFifoDepositThatFitsAndSkipsTheRest(uint96[6] memory rawAmounts, uint96 rawCap)
         public
     {
         uint256 cap = bound(rawCap, 1e6, 100_000e6);
         vm.prank(owner);
         vault.setOutflowCap(address(usdc), cap);
-        uint256[4] memory amounts;
-        for (uint256 i; i < 4; ++i) {
+        uint256[6] memory amounts;
+        for (uint256 i; i < 6; ++i) {
             amounts[i] = bound(rawAmounts[i], 1e6, cap);
             _deposit(RECIPIENT, address(usdc), amounts[i]);
         }
+        bool[6] memory paid;
         uint256 expectedCount;
         uint256 expectedGross;
-        for (uint256 i; i < 4; ++i) {
-            if (amounts[i] > cap - expectedGross) break;
+        uint256 firstSkipped;
+        for (uint256 i; i < 6; ++i) {
+            if (amounts[i] > cap - expectedGross) {
+                if (firstSkipped == 0) firstSkipped = i + 1;
+                continue;
+            }
+            paid[i] = true;
             expectedGross += amounts[i];
             ++expectedCount;
         }
+        assertGe(expectedCount, 1, "the first deposit always fits an empty window");
         assertEq(_claim(RECIPIENT, dest, _tokens(address(usdc)), 0), expectedCount);
         assertEq(usdc.balanceOf(dest), expectedGross);
         assertEq(vault.rollingOutflow(address(usdc)), expectedGross);
         assertLe(expectedGross, cap);
-        assertEq(vault.openDepositCount(RECIPIENT), 4 - expectedCount);
-        for (uint256 i; i < 4; ++i) {
-            assertEq(
-                uint256(_status(i + 1)),
-                uint256(i < expectedCount ? HandleVault.Status.Claimed : HandleVault.Status.Open)
-            );
+        assertEq(vault.openDepositCount(RECIPIENT), 6 - expectedCount);
+        assertEq(vault.firstOpenDeposit(RECIPIENT, address(usdc)), firstSkipped);
+        for (uint256 i; i < 6; ++i) {
+            assertEq(uint256(_status(i + 1)), uint256(paid[i] ? HandleVault.Status.Claimed : HandleVault.Status.Open));
         }
         _assertAccounting(address(usdc));
+    }
+
+    /// @dev Same model with the per-recipient share active and another recipient having used part
+    /// of the shared window first: capacity is the lesser of the recipient's share and what the
+    /// shared window has left, and neither recipient's claim can push either window past its cap.
+    function testFuzz_skipModelHonoursRecipientShareAndSharedWindow(
+        uint16 rawShare,
+        uint96 rawOtherAmount,
+        uint96[5] memory rawAmounts
+    ) public {
+        uint256 share = bound(rawShare, 100, 10_000);
+        vm.prank(owner);
+        vault.setRecipientShareBps(share);
+        uint256 cap = 100_000e6;
+        uint256 recipientCap = cap * share / 10_000;
+        assertEq(vault.recipientCap(address(usdc)), recipientCap);
+        uint256 otherAmount = bound(rawOtherAmount, 1e6, recipientCap);
+        _deposit(SECOND_RECIPIENT, address(usdc), otherAmount);
+        assertEq(_claim(SECOND_RECIPIENT, dest, _tokens(address(usdc)), 0), 1);
+        uint256[5] memory amounts;
+        for (uint256 i; i < 5; ++i) {
+            amounts[i] = bound(rawAmounts[i], 1e6, recipientCap);
+            _deposit(RECIPIENT, address(usdc), amounts[i]);
+        }
+        uint256 available = recipientCap < cap - otherAmount ? recipientCap : cap - otherAmount;
+        assertEq(vault.recipientRemainingOutflow(RECIPIENT, address(usdc)), available);
+        bool[5] memory paid;
+        uint256 expectedCount;
+        uint256 expectedGross;
+        for (uint256 i; i < 5; ++i) {
+            if (amounts[i] > available - expectedGross) continue;
+            paid[i] = true;
+            expectedGross += amounts[i];
+            ++expectedCount;
+        }
+        uint256 deadline = vm.getBlockTimestamp() + 1 hours;
+        bytes memory sig = _signature(OWNER_KEY, RECIPIENT, dest, 0, deadline);
+        if (expectedCount == 0) {
+            vm.expectRevert(HandleVault.OutflowCapExceeded.selector);
+            vault.claim(RECIPIENT, dest, _tokens(address(usdc)), 0, deadline, sig);
+            assertFalse(vault.usedNonces(RECIPIENT, 0));
+        } else {
+            assertEq(vault.claim(RECIPIENT, dest, _tokens(address(usdc)), 0, deadline, sig), expectedCount);
+        }
+        assertEq(usdc.balanceOf(dest), otherAmount + expectedGross);
+        assertEq(vault.recipientRollingOutflow(RECIPIENT, address(usdc)), expectedGross);
+        assertEq(vault.recipientRollingOutflow(SECOND_RECIPIENT, address(usdc)), otherAmount);
+        assertEq(vault.rollingOutflow(address(usdc)), otherAmount + expectedGross);
+        assertLe(expectedGross, recipientCap);
+        assertLe(otherAmount + expectedGross, cap);
+        for (uint256 i; i < 5; ++i) {
+            assertEq(uint256(_status(i + 2)), uint256(paid[i] ? HandleVault.Status.Claimed : HandleVault.Status.Open));
+        }
+        // The second recipient's own window is untouched by the first one's sweep.
+        assertEq(
+            vault.recipientRemainingOutflow(SECOND_RECIPIENT, address(usdc)),
+            _min(recipientCap - otherAmount, cap - otherAmount - expectedGross)
+        );
+        _assertAccounting(address(usdc));
+    }
+
+    function _min(uint256 a, uint256 b) private pure returns (uint256) {
+        return a < b ? a : b;
     }
 
     function testFuzz_rollingWindowDropsClaimExactlyAfter24Hours(uint96 rawAmount, uint32 rawDelta) public {
