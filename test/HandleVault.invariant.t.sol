@@ -101,6 +101,7 @@ contract VaultHandler is Test {
         address[] memory selected = new address[](tokenCount);
         uint256 selectedIndex;
         uint256 expectedCount;
+        uint256 visited;
         uint256[] memory payouts = new uint256[](3);
         uint256[] memory beforeBalances = new uint256[](3);
         for (uint256 i; i < 3; ++i) {
@@ -111,13 +112,16 @@ contract VaultHandler is Test {
             uint256 spent = modelOutflow(token);
             uint256 available = spent < caps[token] ? caps[token] - spent : 0;
             uint256 gross;
-            for (uint256 j; j < records.length && expectedCount < 64; ++j) {
+            // The recipient share stays at 100% in this model, so the shared window alone binds.
+            for (uint256 j; j < records.length && expectedCount < 64 && visited < 256; ++j) {
                 ModelDeposit storage record = records[j];
                 if (
                     record.status != HandleVault.Status.Open || record.recipientId != recipientId
                         || record.token != token
                 ) continue;
-                if (record.amount > available - gross) break;
+                ++visited;
+                // A deposit that does not fit is skipped, not a stop: later ones are still examined.
+                if (record.amount > available - gross) continue;
                 uint256 fee = record.amount * modelFeeBps / 10_000;
                 gross += record.amount;
                 payouts[i] += record.amount - fee;
